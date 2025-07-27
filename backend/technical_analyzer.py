@@ -14,57 +14,59 @@ warnings.filterwarnings("ignore")
 
 class TechnicalAnalyzer:
     """
-    Fetches and cleans historical OHLCV data with Alpha Vantage.
+    Fetches and cleans historical OHLCV data with Marketstack.
 
     Notes
     -----
-    • Alpha Vantage free tier allows 5 requests/min and 500 requests/day.
-      Automatic throttling (sleep) is included below.
+    • Marketstack free tier allows 1,000 requests/month and 5 requests/second.
+    • Both end-of-day and intraday data are supported.
     • Only stock symbols are supported here.
     """
 
-    BASE_URL = "https://www.alphavantage.co/query"
-    _AV_FUN_MAP = {
-        # intraday intervals
-        "1min": ("TIME_SERIES_INTRADAY", "1min"),
-        "5min": ("TIME_SERIES_INTRADAY", "5min"),
-        "15min": ("TIME_SERIES_INTRADAY", "15min"),
-        "30min": ("TIME_SERIES_INTRADAY", "30min"),
-        "60min": ("TIME_SERIES_INTRADAY", "60min"),
-        # daily / weekly / monthly
-        "1D": ("TIME_SERIES_DAILY", None),
-        "1W": ("TIME_SERIES_WEEKLY", None),
-        "1M": ("TIME_SERIES_MONTHLY", None),
+    BASE_URL = "https://api.marketstack.com/v1"
+    _MARKETSTACK_INTERVAL_MAP = {
+        # intraday intervals (Basic Plan and higher)
+        "1min": "1min",
+        "5min": "5min", 
+        "15min": "15min",
+        "30min": "30min",
+        "60min": "1hour",
+        # daily data
+        "1D": "daily",
+        "1W": "weekly", 
+        "1M": "monthly",
     }
 
-    def __init__(self, av_api_key: Optional[str] = None, request_pause: float = 12.0):
+    def __init__(self, api_key: Optional[str] = None, request_pause: float = 0.2):
         """
         Parameters
         ----------
-        av_api_key : str, optional
-            Alpha Vantage API key.  Loaded from environment if omitted.
+        api_key : str, optional
+            Marketstack API key. Loaded from environment if omitted.
         request_pause : float
-            Seconds to wait between Alpha Vantage calls (rate-limit helper).
-            Free tier → 5 requests/min ⇒ 12 s pause.
+            Seconds to wait between Marketstack calls (rate-limit helper).
+            Free tier → 5 requests/second ⇒ 0.2s pause.
         """
-        if av_api_key is None:
+        if api_key is None:
             load_dotenv()
-            av_api_key = os.getenv("ALPHAVANTAGE_API_KEY")
+            api_key = os.getenv("MARKETSTACK_API_KEY")
 
-        if not av_api_key:
+        if not api_key:
             raise ValueError(
-                "ALPHAVANTAGE_API_KEY not found.  Add it to your .env or pass explicitly."
+                "MARKETSTACK_API_KEY not found. Add it to your .env or pass explicitly."
             )
 
-        self.api_key = av_api_key
+        self.api_key = api_key
         self.request_pause = max(request_pause, 0)
 
     # PUBLIC METHODS
     def get_historical_data(
         self,
         symbols: List[str],
-        interval: str = "60min",
-        outputsize: str = "compact",
+        interval: str = "1D",
+        limit: int = 100,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
     ) -> pd.DataFrame:
         """
         Fetch and clean OHLCV data for multiple symbols.
@@ -74,11 +76,14 @@ class TechnicalAnalyzer:
         symbols : list[str]
             Stock tickers (eg. ["AAPL", "MSFT"]).
         interval : str
-            • Intraday: 1min,5min,15min,30min,60min  
-            • Daily/Weekly/Monthly use "1D","1W","1M".
-        outputsize : str
-            'compact' (latest 100 pts) or 'full' (all available).
-            Ignored for weekly/monthly.
+            • Intraday: 1min,5min,15min,30min,60min (Basic Plan+)
+            • Daily/Weekly/Monthly: 1D,1W,1M
+        limit : int
+            Number of data points to retrieve (max 1000).
+        date_from : str, optional
+            Start date in YYYY-MM-DD format.
+        date_to : str, optional
+            End date in YYYY-MM-DD format.
 
         Returns
         -------
@@ -87,11 +92,11 @@ class TechnicalAnalyzer:
             symbol, datetime, open, high, low, close, volume,
             price_change, price_change_pct, typical_price, true_range
         """
-        print(f"Fetching Alpha Vantage data for {len(symbols)} symbols …")
+        print(f"Fetching Marketstack data for {len(symbols)} symbols …")
         dfs = []
         for idx, sym in enumerate(symbols, 1):
             try:
-                raw = self._fetch_symbol(sym, interval, outputsize)
+                raw = self._fetch_symbol(sym, interval, limit, date_from, date_to)
                 if raw.empty:
                     print(f"No data for {sym}")
                     continue
@@ -116,22 +121,15 @@ class TechnicalAnalyzer:
         """
         Convenience helper - returns most recent bar (per symbol).
         """
-        latest = self.get_historical_data(symbols, interval="1D", outputsize="compact")
+        latest = self.get_historical_data(symbols, interval="1D", limit=1)
         if latest.empty:
             return pd.DataFrame()
 
-        return (
-            latest.sort_values("datetime")
-            .groupby("symbol")
-            .tail(1)
-            .reset_index(drop=True)[
-                ["symbol", "datetime", "close", "volume", "price_change_pct"]
-            ]
-        )
+        return latest[["symbol", "datetime", "close", "volume", "price_change_pct"]]
 
     def validate_data_quality(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
-        basic sanity checks.
+        Basic sanity checks.
         """
         if df.empty:
             return {"status": "empty", "issues": ["No data"]}
@@ -163,59 +161,90 @@ class TechnicalAnalyzer:
 
     # INTERNAL HELPERS
     def _fetch_symbol(
-        self, symbol: str, interval: str, outputsize: str
+        self, 
+        symbol: str, 
+        interval: str, 
+        limit: int,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None
     ) -> pd.DataFrame:
-        """Call Alpha Vantage and parse JSON into DataFrame."""
-        func, av_interval = self._map_interval(interval)
+        """Call Marketstack and parse JSON into DataFrame."""
+        
+        # Determine endpoint based on interval
+        if interval in ["1min", "5min", "15min", "30min", "60min"]:
+            endpoint = "intraday"
+            ms_interval = self._MARKETSTACK_INTERVAL_MAP[interval]
+        else:
+            endpoint = "eod"
+            ms_interval = None
 
+        url = f"{self.BASE_URL}/{endpoint}"
+        
         params = {
-            "function": func,
-            "symbol": symbol,
-            "apikey": self.api_key,
-            "datatype": "json",
+            "access_key": self.api_key,
+            "symbols": symbol,
+            "limit": limit,
         }
-        if func == "TIME_SERIES_INTRADAY":
-            params["interval"] = av_interval
-            params["outputsize"] = outputsize  # compact/full
+        
+        if ms_interval:
+            params["interval"] = ms_interval
+            
+        if date_from:
+            params["date_from"] = date_from
+            
+        if date_to:
+            params["date_to"] = date_to
 
-        resp = requests.get(self.BASE_URL, params=params, timeout=30)
+        resp = requests.get(url, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
 
-        # Alpha Vantage nests data under a key that starts with "Time Series"
-        key = next(
-            (k for k in data.keys() if "Time Series" in k), None
-        )
-        if key is None:
-            # API error message
-            raise ValueError(data.get("Note") or data.get("Error Message") or "Unknown")
+        # Handle API errors
+        if "error" in data:
+            error_info = data["error"]
+            error_msg = error_info.get("message", "Unknown error")
+            error_code = error_info.get("code", "unknown")
+            
+            if error_code == "rate_limit_reached":
+                print(f"⚠️ Marketstack Rate Limit: {error_msg}")
+                raise ValueError(f"Rate limit reached: {error_msg}")
+            elif error_code == "function_access_restricted":
+                print(f"⚠️ Marketstack Access Restricted: {error_msg}")
+                raise ValueError(f"Feature not available on current plan: {error_msg}")
+            else:
+                print(f"❌ Marketstack Error [{error_code}]: {error_msg}")
+                raise ValueError(f"Marketstack API error: {error_msg}")
 
+        # Check if we have data
+        if "data" not in data or not data["data"]:
+            print(f"❌ No data found for {symbol}")
+            return pd.DataFrame()
+
+        # Parse the data
         records = []
-        for dt_str, bar in data[key].items():
-            records.append(
-                {
-                    "datetime": pd.to_datetime(dt_str),
-                    "open": float(bar["1. open"]),
-                    "high": float(bar["2. high"]),
-                    "low": float(bar["3. low"]),
-                    "close": float(bar["4. close"]),
-                    "volume": float(bar.get("5. volume", 0)),
-                }
-            )
+        for item in data["data"]:
+            records.append({
+                "datetime": pd.to_datetime(item["date"]),
+                "open": float(item["open"]),
+                "high": float(item["high"]), 
+                "low": float(item["low"]),
+                "close": float(item["close"]),
+                "volume": float(item.get("volume", 0)),
+            })
 
         return pd.DataFrame(records)
 
     @staticmethod
     def _map_interval(interval: str):
-        """Return (function, av_interval) tuple for given interval string."""
-        if interval not in TechnicalAnalyzer._AV_FUN_MAP:
+        """Return marketstack interval for given interval string."""
+        if interval not in TechnicalAnalyzer._MARKETSTACK_INTERVAL_MAP:
             raise ValueError(
                 f"Unsupported interval '{interval}'. "
                 "Use one of: 1min,5min,15min,30min,60min,1D,1W,1M"
             )
-        return TechnicalAnalyzer._AV_FUN_MAP[interval]
+        return TechnicalAnalyzer._MARKETSTACK_INTERVAL_MAP[interval]
 
-    # DATA CLEANING + FEATURE ENGINEERING
+    # DATA CLEANING + FEATURE ENGINEERING  
     def _clean_historical_data(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return df
@@ -236,7 +265,7 @@ class TechnicalAnalyzer:
 
         cols = [
             "symbol",
-            "datetime",
+            "datetime", 
             "open",
             "high",
             "low",

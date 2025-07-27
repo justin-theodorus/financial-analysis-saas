@@ -316,7 +316,6 @@ class TechnicalIndicators:
         
         return overall_signal, overall_confidence, recommendation
 
-    
     def analyze_portfolio(self, historical_data: pd.DataFrame) -> Dict[str, TechnicalAnalysisResult]:
         """
         Analyze multiple symbols from historical data
@@ -397,12 +396,12 @@ if __name__ == "__main__":
     tech_analyzer = TechnicalAnalyzer()
     tech_indicators = TechnicalIndicators()
     
-    # Fetch historical data
+    # Fetch historical data with more data points for better analysis
     symbols = ['AAPL', 'MSFT']
     historical_data = tech_analyzer.get_historical_data(
         symbols=symbols, 
         interval='1D', 
-        outputsize='compact'
+        limit=100  # Get more data points for better technical analysis
     )
     
     if not historical_data.empty:

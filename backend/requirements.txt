@@ -10,3 +10,5 @@ python-dotenv
 pytest
 pytest-mock
 requests-mock
+uvicorn
+fastapi

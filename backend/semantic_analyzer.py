@@ -157,13 +157,29 @@ class FinancialSemanticAnalyzer:
                 'tickers': symbol,
                 'dateFrom': start_date.strftime('%Y-%m-%d'),
                 'dateTo': end_date.strftime('%Y-%m-%d'),
-                'pageSize': 100
+                'pageSize': 100,
+                "displayOutput": "abstract"
+            }
+            
+            
+            headers = {
+                'accept': 'application/json'
             }
             
             try:
-                response = requests.get(url, params=params)
+                response = requests.get(url, params=params, headers=headers)
                 response.raise_for_status()
+                
                 data = response.json()
+                
+                
+                if isinstance(data, dict):
+                    articles = data.get('data', [])
+                elif isinstance(data, list):
+                    articles = data
+                else:
+                    print(f"Unexpected Benzinga response format for {symbol}")
+                    continue
                 
                 for article in data.get('data', []):
                     news_data.append({
@@ -177,6 +193,10 @@ class FinancialSemanticAnalyzer:
                     
             except requests.RequestException as e:
                 print(f"Error fetching news for {symbol}: {e}")
+            except ValueError as e:  # JSON decode error
+                print(f"JSON parsing error for {symbol}: {e}")
+                print(f"Response content-type: {response.headers.get('content-type')}")
+                print(f"Response text (first 200 chars): {response.text[:200]}")
                 
         return pd.DataFrame(news_data)
     
